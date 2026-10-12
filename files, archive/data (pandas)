@@ -1,1 +1,88 @@
+"""SQLite access layer. Each call opens its own connection, so it is thread-safe."""
+import os
+import sqlite3
+from contextlib import contextmanager
 
+import config
+
+
+@contextmanager
+def connect():
+    os.makedirs(os.path.dirname(config.DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(config.DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def init_db():
+    with open(os.path.join(config.BASE_DIR, "schema.sql"), "r", encoding="utf-8") as f:
+        script = f.read()
+    with connect() as conn:
+        conn.executescript(script)
+
+
+def save_file_result(filename, total, valid, invalid, dup, status, error, duration):
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO processed_files (filename, total_rows, valid_rows, invalid_rows, "
+            "duplicate_rows, status, error, duration_sec) VALUES (?,?,?,?,?,?,?,?)",
+            (filename, total, valid, invalid, dup, status, error, round(duration, 3)))
+
+
+def save_api_records(source, records):
+    """Insert new records only (duplicates ignored). Returns number inserted."""
+    inserted = 0
+    with connect() as conn:
+        for r in records:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO api_records (source, external_id, title, body) VALUES (?,?,?,?)",
+                (source, r["id"], r.get("title", ""), r.get("body", "")))
+            inserted += cur.rowcount
+    return inserted
+
+
+def log_job(name, status, message, duration):
+    with connect() as conn:
+        conn.execute("INSERT INTO job_runs (job_name, status, message, duration_sec) VALUES (?,?,?,?)",
+                     (name, status, message, round(duration, 3)))
+
+
+def add_notification(channel, subject, message, status):
+    with connect() as conn:
+        conn.execute("INSERT INTO notifications (channel, subject, message, status) VALUES (?,?,?,?)",
+                     (channel, subject, message, status))
+
+
+def get_stats():
+    """Aggregated data for reports and the dashboard."""
+    with connect() as c:
+        f = c.execute(
+            "SELECT COUNT(*) AS files, COALESCE(SUM(valid_rows),0) AS valid, "
+            "COALESCE(SUM(invalid_rows),0) AS invalid, COALESCE(SUM(duplicate_rows),0) AS dup, "
+            "COALESCE(SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END),0) AS failed "
+            "FROM processed_files").fetchone()
+        j = c.execute(
+            "SELECT COUNT(*) AS runs, COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),0) AS ok "
+            "FROM job_runs").fetchone()
+        api = c.execute("SELECT COUNT(*) AS n FROM api_records").fetchone()["n"]
+        notes = c.execute("SELECT COUNT(*) AS n FROM notifications").fetchone()["n"]
+        recent_files = [dict(r) for r in c.execute(
+            "SELECT filename, valid_rows, invalid_rows, duplicate_rows, status, duration_sec, processed_at "
+            "FROM processed_files ORDER BY id DESC LIMIT 10")]
+        recent_jobs = [dict(r) for r in c.execute(
+            "SELECT job_name, status, message, duration_sec, started_at FROM job_runs ORDER BY id DESC LIMIT 10")]
+    return {
+        "files_processed": f["files"], "valid_rows": f["valid"], "invalid_rows": f["invalid"],
+        "duplicate_rows": f["dup"], "failed_files": f["failed"],
+        "job_runs": j["runs"],
+        "job_success_rate": round(j["ok"] / j["runs"] * 100, 1) if j["runs"] else 0.0,
+        "api_records": api, "notifications": notes,
+        "recent_files": recent_files, "recent_jobs": recent_jobs,
+    }
